@@ -81,24 +81,98 @@
 
 #include "utils.h"
 
+__global__
+void reduce_minmax(float * d_out, const float * d_in){
+
+
+    extern __shared__ float sdata[];
+
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int tid = threadIdx.x;
+
+    sdata[tid] = d_in[myId]; // copying global to shared memory
+
+    __syncthreads(); // make sure entire block is copied
+
+    // reduction in shared mem
+    size_t len = blockDim.x;
+    for (size_t s = len / 2; s > 0; s = s >> 1) {
+        if(tid < s){
+            // only read first not to override read value
+            float min, max;
+            min = fmin(sdata[tid], sdata[tid+s]); // min - read from first half
+            max = fmax(sdata[len - tid - 1], sdata[len - tid - s-1]); // max - read from second half
+
+            sdata[tid] = min;
+            sdata[blockDim.x - tid - 1] = max;// max
+        }
+
+        __syncthreads();
+    }
+
+
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = sdata[0]; // min will be at 0
+        d_out[blockDim.x + blockIdx.x] = sdata[len-1]; // max will be at len-1
+    }
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
                                   float &max_logLum,
                                   const size_t numRows,
                                   const size_t numCols,
-                                  const size_t numBins)
-{
-  //TODO
-  /*Here are the steps you need to implement
-    1) find the minimum and maximum value in the input logLuminance channel
-       store in min_logLum and max_logLum
+                                  const size_t numBins) {
+    /*
+      1) find the minimum and maximum value in the input logLuminance channel
+         store in min_logLum and max_logLum
+ */
+
+    // declare GPU memory pointers
+    float * d_intermediate, * d_out;
+
+    // assumes that size is not greater than maxThreadsPerBlock^2
+    // and that size is a multiple of maxThreadsPerBlock
+    // 512x768 or 256x384
+    const int maxThreadsPerBlock = 1024;
+    int threads = maxThreadsPerBlock;
+    int blocks = numCols*numRows / maxThreadsPerBlock;
+
+    // allocate GPU memory
+    checkCudaErrors(cudaMalloc((void **) &d_intermediate, 2 * blocks * sizeof(float))); // overallocated
+    checkCudaErrors(cudaMalloc((void **) &d_out, 2 * sizeof(float)));
+
+    reduce_minmax<<<blocks, threads, sizeof(float)*threads>>>(d_intermediate, d_logLuminance);
+
+    // now we're down to one block left, so reduce it
+    threads = blocks; // launch one thread for each block in prev step
+    blocks = 2; // min and max simultaneously
+
+    reduce_minmax <<<blocks, threads, sizeof(float) * threads>>>(d_out, d_intermediate);
+
+    float h_min_max[2];
+    checkCudaErrors(cudaMemcpy(h_min_max, d_out, 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    min_logLum=h_min_max[0];
+    max_logLum=h_min_max[1];
+
+
+/*
     2) subtract them to find the range
+*/
+    float lumRange = max_logLum - min_logLum;
+
+    /*
     3) generate a histogram of all the values in the logLuminance channel using
        the formula: bin = (lum[i] - lumMin) / lumRange * numBins
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+//    std::cout << "min: " << h_min_max[0] << " max: " << h_min_max[1] << std::endl;
+
+    checkCudaErrors(cudaFree(d_out));
+    checkCudaErrors(cudaFree(d_intermediate));
 
 }
